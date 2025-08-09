@@ -12,12 +12,14 @@ from pydantic import BaseModel, Field, AnyUrl
 import markdownify
 import httpx
 import readabilipy
+from huggingface_hub import InferenceClient
 
 # --- Load environment variables ---
 load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
 
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
@@ -202,6 +204,72 @@ async def make_img_black_and_white(
         return [ImageContent(type="image", mimeType="image/png", data=bw_base64)]
     except Exception as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
+
+# --- Hugging Face Tools ---
+HF_TEXT_DESCRIPTION = RichToolDescription(
+    description="Generate text using a Hugging Face text-generation model via Inference API.",
+    use_when="Use this to generate or continue text given a prompt using a HF-hosted model.",
+)
+
+@mcp.tool(description=HF_TEXT_DESCRIPTION.model_dump_json())
+async def hf_text_generate(
+    model: Annotated[str, Field(description="Hugging Face model id, e.g., 'meta-llama/Llama-3.2-3B-Instruct' or 'Qwen/Qwen2.5-7B-Instruct'")],
+    prompt: Annotated[str, Field(description="The input prompt for generation")],
+    max_new_tokens: Annotated[int | None, Field(description="Maximum new tokens to generate")] = 256,
+    temperature: Annotated[float | None, Field(description="Sampling temperature (higher = more random)")] = 0.7,
+    top_p: Annotated[float | None, Field(description="Top-p nucleus sampling cutoff")] = 0.95,
+) -> str:
+    try:
+        client = InferenceClient(api_key=HF_API_TOKEN)
+        # Run blocking HF call in a thread to avoid blocking the event loop
+        generated_text = await asyncio.to_thread(
+            client.text_generation,
+            prompt,
+            model=model,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=False,
+        )
+        # client.text_generation may return a string or a dict depending on version; normalize to string
+        if isinstance(generated_text, dict) and "generated_text" in generated_text:
+            return str(generated_text["generated_text"])
+        return str(generated_text)
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Hugging Face text generation failed: {e}"))
+
+HF_IMAGE_DESCRIPTION = RichToolDescription(
+    description="Generate an image from text using a Hugging Face diffusion model via Inference API.",
+    use_when="Use this when the user requests an image given a text prompt.",
+    side_effects="Returns a generated image as base64-encoded PNG.",
+)
+
+@mcp.tool(description=HF_IMAGE_DESCRIPTION.model_dump_json())
+async def hf_text_to_image(
+    model: Annotated[str, Field(description="Hugging Face model id for text-to-image, e.g., 'stabilityai/stable-diffusion-xl-base-1.0' or 'black-forest-labs/FLUX.1-dev'")],
+    prompt: Annotated[str, Field(description="The text description for the image")],
+    guidance_scale: Annotated[float | None, Field(description="Classifier-free guidance scale (model-dependent)")] = 7.5,
+    num_inference_steps: Annotated[int | None, Field(description="Number of denoising steps (model-dependent)")] = 28,
+) -> list[TextContent | ImageContent]:
+    import base64
+    import io
+    from PIL import Image
+
+    try:
+        client = InferenceClient(api_key=HF_API_TOKEN)
+        image: Image.Image = await asyncio.to_thread(
+            client.text_to_image,
+            prompt,
+            model=model,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+        )
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return [ImageContent(type="image", mimeType="image/png", data=img_b64)]
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Hugging Face image generation failed: {e}"))
 
 # --- Run MCP Server ---
 async def main():
