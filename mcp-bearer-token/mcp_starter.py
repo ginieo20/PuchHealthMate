@@ -19,7 +19,9 @@ load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HF_API_TOKEN")
+HF_PROVIDER = os.environ.get("HF_PROVIDER")
+MODEL_ID = os.environ.get("MODEL_ID")
 
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
@@ -220,7 +222,7 @@ async def hf_text_generate(
     top_p: Annotated[float | None, Field(description="Top-p nucleus sampling cutoff")] = 0.95,
 ) -> str:
     try:
-        client = InferenceClient(api_key=HF_API_TOKEN)
+        client = InferenceClient(api_key=HF_TOKEN)
         # Run blocking HF call in a thread to avoid blocking the event loop
         generated_text = await asyncio.to_thread(
             client.text_generation,
@@ -256,7 +258,7 @@ async def hf_text_to_image(
     from PIL import Image
 
     try:
-        client = InferenceClient(api_key=HF_API_TOKEN)
+        client = InferenceClient(api_key=HF_TOKEN)
         image: Image.Image = await asyncio.to_thread(
             client.text_to_image,
             prompt,
@@ -270,6 +272,37 @@ async def hf_text_to_image(
         return [ImageContent(type="image", mimeType="image/png", data=img_b64)]
     except Exception as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Hugging Face image generation failed: {e}"))
+
+# Chat completion tool matching test.py style
+HF_CHAT_DESCRIPTION = RichToolDescription(
+    description="Chat completion via Hugging Face Inference API providers (e.g., fireworks-ai).",
+    use_when="Use this to call chat models like deepseek-ai/DeepSeek-R1 or others with role-based messages.",
+)
+
+@mcp.tool(description=HF_CHAT_DESCRIPTION.model_dump_json())
+async def hf_chat_completion(
+    messages: Annotated[list[dict], Field(description="List of {'role','content'} chat messages")],
+    model: Annotated[str | None, Field(description="Model id to use. Defaults to env MODEL_ID if not provided.")] = None,
+    provider: Annotated[str | None, Field(description="HF provider (e.g., 'fireworks-ai'). Defaults to env HF_PROVIDER if not provided.")] = None,
+    remove_think_tags: Annotated[bool, Field(description="Strip <think>...</think> tags from output if present")] = True,
+) -> str:
+    import re
+    try:
+        resolved_model = model or MODEL_ID
+        if not resolved_model:
+            raise ValueError("Model id not provided and MODEL_ID not set in environment")
+        client = InferenceClient(provider=provider or HF_PROVIDER, api_key=HF_TOKEN)
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=resolved_model,
+            messages=messages,
+        )
+        content = completion.choices[0].message.content
+        if remove_think_tags and isinstance(content, str):
+            content = re.sub(r"<think>.*?</think>\n*", "", content, flags=re.DOTALL)
+        return content.strip() if isinstance(content, str) else str(content)
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Hugging Face chat completion failed: {e}"))
 
 # --- Run MCP Server ---
 async def main():
