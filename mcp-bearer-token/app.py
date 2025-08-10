@@ -48,10 +48,12 @@ def home():
     return "HealthMate + MCP is running"
 
 
-@app.route("/mcp", methods=["GET", "POST", "OPTIONS"])
-@app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS"])
+@app.route("/mcp", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS", "HEAD"])
 def mcp_http_proxy(path: str = ""):
-    target = f"http://127.0.0.1:8765/mcp" + (f"/{path}" if path else "")
+    # Always use trailing slash base to avoid redirects from the internal server
+    base = "http://127.0.0.1:8765/mcp/"
+    target = base + (path or "")
     # Forward only essential headers, ensure Authorization is preserved exactly
     headers = {}
     auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
@@ -68,11 +70,21 @@ def mcp_http_proxy(path: str = ""):
         resp = Response("", status=204)
         resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
         resp.headers["Access-Control-Allow-Headers"] = request.headers.get("Access-Control-Request-Headers", "*")
-        resp.headers["Access-Control-Allow-Methods"] = request.headers.get("Access-Control-Request-Method", "GET,POST,OPTIONS")
+        resp.headers["Access-Control-Allow-Methods"] = request.headers.get("Access-Control-Request-Method", "GET,POST,HEAD,OPTIONS")
         resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
-    client = httpx.Client(timeout=None)
+    client = httpx.Client(timeout=None, follow_redirects=False)
+
+    if request.method == "HEAD":
+        r = client.request("HEAD", target, headers=headers, params=request.args)
+        resp = Response("", status=r.status_code)
+        resp.headers["Content-Type"] = r.headers.get("content-type", "application/octet-stream")
+        resp.headers["Cache-Control"] = r.headers.get("cache-control", "no-cache")
+        resp.headers["Connection"] = r.headers.get("connection", "keep-alive")
+        resp.headers["X-Accel-Buffering"] = "no"
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        return resp
 
     if request.method == "GET":
         upstream = client.stream("GET", target, headers=headers, params=request.args)
