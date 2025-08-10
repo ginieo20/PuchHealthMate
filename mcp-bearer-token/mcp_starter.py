@@ -123,7 +123,7 @@ class Fetch:
 
 # --- MCP Server Setup ---
 mcp = FastMCP(
-    "Job Finder MCP Server",
+    "HealthMate",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
