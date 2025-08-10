@@ -1,7 +1,7 @@
 import asyncio
 import threading
 import os
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, make_response
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 import httpx
@@ -53,22 +53,50 @@ def proxy_mcp(path: str):
     headers = {k: v for k, v in request.headers if k.lower() != "host"}
     method = request.method.upper()
 
+    if method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        resp.headers["Access-Control-Allow-Headers"] = request.headers.get("Access-Control-Request-Headers", "*")
+        resp.headers["Access-Control-Allow-Methods"] = request.headers.get("Access-Control-Request-Method", "GET,POST,OPTIONS")
+        resp.headers["Access-Control-Max-Age"] = "86400"
+        return resp
+
     if method == "GET":
+        client = httpx.Client(timeout=None)
+        r = client.build_request("GET", target_url, headers=headers, params=request.args)
         def generate():
-            with httpx.stream("GET", target_url, headers=headers, params=request.args, timeout=None) as r:
-                for chunk in r.iter_bytes():
+            with client.stream(r.method, r.url, headers=r.headers, params=request.args, timeout=None) as upstream:
+                for chunk in upstream.iter_bytes():
                     if chunk:
                         yield chunk
-        return Response(stream_with_context(generate()), status=200)
+        # Fetch only headers and status first
+        with client.stream("GET", target_url, headers=headers, params=request.args, timeout=None) as upstream_head:
+            status = upstream_head.status_code
+            content_type = upstream_head.headers.get("content-type", "application/octet-stream")
+            resp = Response(stream_with_context(generate()), status=status, direct_passthrough=True)
+            resp.headers["Content-Type"] = content_type
+            # Pass through cache/control headers helpful for SSE
+            for h in ("cache-control", "connection", "transfer-encoding", "x-accel-buffering"):
+                if upstream_head.headers.get(h):
+                    resp.headers[h.title()] = upstream_head.headers[h]
+            return resp
 
     elif method == "POST":
         data = request.get_data()
-        def generate():
-            with httpx.stream("POST", target_url, headers=headers, content=data, timeout=None) as r:
-                for chunk in r.iter_bytes():
+        client = httpx.Client(timeout=None)
+        with client.stream("POST", target_url, headers=headers, content=data, timeout=None) as upstream:
+            status = upstream.status_code
+            content_type = upstream.headers.get("content-type", "application/octet-stream")
+            def generate_post():
+                for chunk in upstream.iter_bytes():
                     if chunk:
                         yield chunk
-        return Response(stream_with_context(generate()), status=200)
+            resp = Response(stream_with_context(generate_post()), status=status, direct_passthrough=True)
+            resp.headers["Content-Type"] = content_type
+            for h in ("cache-control", "connection", "transfer-encoding", "x-accel-buffering"):
+                if upstream.headers.get(h):
+                    resp.headers[h.title()] = upstream.headers[h]
+            return resp
 
     return Response(status=405)
 
