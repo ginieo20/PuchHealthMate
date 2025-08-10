@@ -1,10 +1,17 @@
 import asyncio
 import threading
 import os
-from flask import Flask, request, jsonify, Response, stream_with_context, make_response
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 import httpx
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse, Response
+from starlette.routing import Route, Mount
+from starlette.middleware.wsgi import WSGIMiddleware
 
 # Reuse the MCP server from mcp_starter
 from mcp_starter import main as mcp_main
@@ -16,7 +23,8 @@ HF_PROVIDER = os.environ.get("HF_PROVIDER")
 MODEL_ID = os.environ.get("MODEL_ID", "google/flan-t5-large")
 MCP_INTERNAL = "http://127.0.0.1:8086"
 
-app = Flask(__name__)
+# Flask app for REST endpoints
+flask_app = Flask(__name__)
 
 
 # Start MCP server in a background thread exactly once
@@ -40,70 +48,7 @@ def ensure_mcp_started():
 ensure_mcp_started()
 
 
-@app.get("/")
-def health_root():
-    return jsonify({"service": "HealthMate", "status": "ok"}), 200
-
-
-# Reverse proxy any /mcp* path to the internal MCP server
-@app.route("/mcp", defaults={"path": ""}, methods=["GET", "POST", "OPTIONS"])
-@app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS"])
-def proxy_mcp(path: str):
-    target_url = f"{MCP_INTERNAL}/mcp/{path}" if path else f"{MCP_INTERNAL}/mcp"
-    headers = {k: v for k, v in request.headers if k.lower() != "host"}
-    method = request.method.upper()
-
-    if method == "OPTIONS":
-        resp = make_response("", 204)
-        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
-        resp.headers["Access-Control-Allow-Headers"] = request.headers.get("Access-Control-Request-Headers", "*")
-        resp.headers["Access-Control-Allow-Methods"] = request.headers.get("Access-Control-Request-Method", "GET,POST,OPTIONS")
-        resp.headers["Access-Control-Max-Age"] = "86400"
-        return resp
-
-    client = httpx.Client(timeout=None)
-
-    if method == "GET":
-        with client.stream("GET", target_url, headers=headers, params=request.args, timeout=None) as upstream:
-            status = upstream.status_code
-            content_type = upstream.headers.get("content-type", "application/octet-stream")
-
-            def generate():
-                for chunk in upstream.iter_bytes():
-                    if chunk:
-                        yield chunk
-
-            resp = Response(stream_with_context(generate()), status=status, direct_passthrough=True)
-            resp.headers["Content-Type"] = content_type
-            resp.headers["Cache-Control"] = upstream.headers.get("cache-control", "no-cache")
-            resp.headers["Connection"] = upstream.headers.get("connection", "keep-alive")
-            if upstream.headers.get("x-accel-buffering"):
-                resp.headers["X-Accel-Buffering"] = upstream.headers["x-accel-buffering"]
-            return resp
-
-    elif method == "POST":
-        data = request.get_data()
-        with client.stream("POST", target_url, headers=headers, content=data, timeout=None) as upstream:
-            status = upstream.status_code
-            content_type = upstream.headers.get("content-type", "application/octet-stream")
-
-            def generate_post():
-                for chunk in upstream.iter_bytes():
-                    if chunk:
-                        yield chunk
-
-            resp = Response(stream_with_context(generate_post()), status=status, direct_passthrough=True)
-            resp.headers["Content-Type"] = content_type
-            resp.headers["Cache-Control"] = upstream.headers.get("cache-control", "no-cache")
-            resp.headers["Connection"] = upstream.headers.get("connection", "keep-alive")
-            if upstream.headers.get("x-accel-buffering"):
-                resp.headers["X-Accel-Buffering"] = upstream.headers["x-accel-buffering"]
-            return resp
-
-    return Response(status=405)
-
-
-@app.post("/api/chat")
+@flask_app.post("/api/chat")
 def chat_completion():
     data = request.get_json(force=True)
     messages = data.get("messages")
@@ -120,7 +65,7 @@ def chat_completion():
         return jsonify({"error": str(e)}), 500
 
 
-@app.post("/api/generate")
+@flask_app.post("/api/generate")
 def text_generate():
     data = request.get_json(force=True)
     prompt = data.get("prompt")
@@ -144,6 +89,63 @@ def text_generate():
         return jsonify({"error": str(e)}), 500
 
 
+# Starlette handlers for root health and /mcp proxy
+async def root(request: Request) -> Response:
+    return JSONResponse({"service": "HealthMate", "status": "ok"})
+
+
+async def proxy_mcp(request: Request) -> Response:
+    # Proxy GET/POST to internal MCP (supports streaming)
+    target_url = MCP_INTERNAL + "/mcp" + ("/" + request.path_params.get("path", "") if request.path_params.get("path") else "")
+    headers = {k.decode() if isinstance(k, bytes) else k: v for k, v in request.headers.raw if k.lower() != b"host"}
+    timeout = httpx.Timeout(None)
+
+    if request.method == "OPTIONS":
+        return Response("", status_code=204, headers={
+            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
+            "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers", "*"),
+            "Access-Control-Allow-Methods": request.headers.get("access-control-request-method", "GET,POST,OPTIONS"),
+            "Access-Control-Max-Age": "86400",
+        })
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if request.method == "GET":
+            upstream = await client.stream("GET", target_url, headers=headers, params=dict(request.query_params))
+        elif request.method == "POST":
+            body = await request.body()
+            upstream = await client.stream("POST", target_url, headers=headers, content=body)
+        else:
+            return Response(status_code=405)
+
+        async def aiter_bytes():
+            async for chunk in upstream.aiter_bytes():
+                if chunk:
+                    yield chunk
+            await upstream.aclose()
+
+        content_type = upstream.headers.get("content-type", "application/octet-stream")
+        resp = StreamingResponse(aiter_bytes(), status_code=upstream.status_code, media_type=content_type)
+        resp.headers["Cache-Control"] = upstream.headers.get("cache-control", "no-cache")
+        resp.headers["Connection"] = upstream.headers.get("connection", "keep-alive")
+        if upstream.headers.get("x-accel-buffering"):
+            resp.headers["X-Accel-Buffering"] = upstream.headers["x-accel-buffering"]
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
+        return resp
+
+
+routes = [
+    Route("/", root, methods=["GET"]),
+    Route("/mcp", proxy_mcp, methods=["GET", "POST", "OPTIONS"]),
+    Route("/mcp/{path:path}", proxy_mcp, methods=["GET", "POST", "OPTIONS"]),
+    Mount("/", app=WSGIMiddleware(flask_app)),
+]
+
+middleware = [Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)]
+
+asgi_app = Starlette(routes=routes, middleware=middleware)
+
+
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    uvicorn.run(asgi_app, host="0.0.0.0", port=port, log_level="info")
