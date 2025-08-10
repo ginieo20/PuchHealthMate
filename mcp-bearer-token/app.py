@@ -1,9 +1,10 @@
 import asyncio
 import threading
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
+import httpx
 
 # Reuse the MCP server from mcp_starter
 from mcp_starter import main as mcp_main
@@ -13,6 +14,7 @@ load_dotenv()
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HF_API_TOKEN")
 HF_PROVIDER = os.environ.get("HF_PROVIDER")
 MODEL_ID = os.environ.get("MODEL_ID", "google/flan-t5-large")
+MCP_INTERNAL = "http://127.0.0.1:8086"
 
 app = Flask(__name__)
 
@@ -25,6 +27,34 @@ def run_mcp_server():
 def start_mcp_in_thread():
     t = threading.Thread(target=run_mcp_server, daemon=True)
     t.start()
+
+
+# Reverse proxy any /mcp* path to the internal MCP server
+@app.route("/mcp", defaults={"path": ""}, methods=["GET", "POST", "OPTIONS"])
+@app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS"])
+def proxy_mcp(path: str):
+    target_url = f"{MCP_INTERNAL}/mcp/{path}" if path else f"{MCP_INTERNAL}/mcp"
+    headers = {k: v for k, v in request.headers if k.lower() != "host"}
+    method = request.method.upper()
+
+    if method == "GET":
+        def generate():
+            with httpx.stream("GET", target_url, headers=headers, params=request.args, timeout=None) as r:
+                for chunk in r.iter_bytes():
+                    if chunk:
+                        yield chunk
+        return Response(stream_with_context(generate()), status=200)
+
+    elif method == "POST":
+        data = request.get_data()
+        def generate():
+            with httpx.stream("POST", target_url, headers=headers, content=data, timeout=None) as r:
+                for chunk in r.iter_bytes():
+                    if chunk:
+                        yield chunk
+        return Response(stream_with_context(generate()), status=200)
+
+    return Response(status=405)
 
 
 @app.post("/api/chat")
@@ -69,4 +99,5 @@ def text_generate():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
