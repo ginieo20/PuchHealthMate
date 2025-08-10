@@ -94,10 +94,22 @@ async def root(request: Request) -> Response:
     return JSONResponse({"service": "HealthMate", "status": "ok"})
 
 
+def _build_forward_headers(req: Request) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for k_bytes, v_bytes in req.headers.raw:
+        k = k_bytes.decode() if isinstance(k_bytes, (bytes, bytearray)) else str(k_bytes)
+        if k.lower() == "host":
+            continue
+        v = v_bytes.decode() if isinstance(v_bytes, (bytes, bytearray)) else str(v_bytes)
+        headers[k] = v
+    return headers
+
+
 async def proxy_mcp(request: Request) -> Response:
     # Proxy GET/POST to internal MCP (supports streaming)
-    target_url = MCP_INTERNAL + "/mcp" + ("/" + request.path_params.get("path", "") if request.path_params.get("path") else "")
-    headers = {k.decode() if isinstance(k, bytes) else k: v for k, v in request.headers.raw if k.lower() != b"host"}
+    path_suffix = "/" + request.path_params.get("path", "") if request.path_params.get("path") else ""
+    target_url = f"{MCP_INTERNAL}/mcp{path_suffix}"
+    headers = _build_forward_headers(request)
     timeout = httpx.Timeout(None)
 
     if request.method == "OPTIONS":
