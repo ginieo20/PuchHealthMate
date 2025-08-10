@@ -1,32 +1,42 @@
 import os
 import threading
 import asyncio
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_sock import Sock
+from dotenv import load_dotenv
+import httpx
 
-from fastmcp.server import Server
+from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
+from mcp.server.auth.provider import AccessToken
 
 # ===== MCP SETUP =====
+load_dotenv()
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "test-token")
 SERVER_ID = "HealthMate"
 
-mcp_server = Server(
-    id=SERVER_ID,
-    auth_provider=BearerAuthProvider(
-        token=AUTH_TOKEN,
-        key_pair=RSAKeyPair.generate()
-    )
-)
 
-# Example MCP tool
-@mcp_server.tool()
-async def ping():
-    return {"message": "pong"}
+class SimpleBearerAuthProvider(BearerAuthProvider):
+    def __init__(self, token: str):
+        k = RSAKeyPair.generate()
+        super().__init__(public_key=k.public_key, jwks_uri=None, issuer=None, audience=None)
+        self._token = token
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if token == self._token:
+            return AccessToken(token=token, client_id="puch-client", scopes=["*"], expires_at=None)
+        return None
+
+
+mcp = FastMCP(SERVER_ID, auth=SimpleBearerAuthProvider(AUTH_TOKEN))
+
+
+async def run_mcp_async():
+    await mcp.run_async("streamable-http", host="127.0.0.1", port=8765)
 
 
 def run_mcp():
-    asyncio.run(mcp_server.run(host="127.0.0.1", port=8765))  # internal only
+    asyncio.run(run_mcp_async())
 
 # ===== FLASK API SETUP =====
 app = Flask(__name__)
@@ -38,45 +48,49 @@ def home():
     return "HealthMate + MCP is running"
 
 
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    data = request.json or {}
-    messages = data.get("messages", [])
-    # For now, just echo
-    return jsonify({"reply": f"Echo: {messages[-1]['content'] if messages else ''}"})
+@app.route("/mcp", methods=["GET", "POST", "OPTIONS"])
+@app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS"])
+def mcp_http_proxy(path: str = ""):
+    target = f"http://127.0.0.1:8765/mcp" + (f"/{path}" if path else "")
+    headers = {k: v for k, v in request.headers if k.lower() != "host"}
 
-# ===== /mcp WebSocket bridge =====
-import websockets
+    if request.method == "OPTIONS":
+        resp = Response("", status=204)
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        resp.headers["Access-Control-Allow-Headers"] = request.headers.get("Access-Control-Request-Headers", "*")
+        resp.headers["Access-Control-Allow-Methods"] = request.headers.get("Access-Control-Request-Method", "GET,POST,OPTIONS")
+        resp.headers["Access-Control-Max-Age"] = "86400"
+        return resp
 
+    client = httpx.Client(timeout=None)
 
-@sock.route('/mcp')
-def mcp_proxy(ws):
-    """WebSocket proxy between Puch AI and internal MCP server."""
-    uri = "ws://127.0.0.1:8765/mcp"
+    if request.method == "GET":
+        upstream = client.stream("GET", target, headers=headers, params=request.args)
+    elif request.method == "POST":
+        upstream = client.stream("POST", target, headers=headers, content=request.get_data())
+    else:
+        return Response(status=405)
 
-    async def bridge():
-        async with websockets.connect(uri, extra_headers={"Authorization": f"Bearer {AUTH_TOKEN}"}) as mcp_ws:
-            async def ws_to_mcp():
-                while True:
-                    msg = await asyncio.to_thread(ws.receive)
-                    if msg is None:
-                        break
-                    await mcp_ws.send(msg)
+    def generate():
+        with upstream as r:
+            for chunk in r.iter_bytes():
+                if chunk:
+                    yield chunk
 
-            async def mcp_to_ws():
-                async for msg in mcp_ws:
-                    await asyncio.to_thread(ws.send, msg)
-
-            await asyncio.gather(ws_to_mcp(), mcp_to_ws())
-
-    asyncio.run(bridge())
+    with client.stream("GET", target, headers=headers, params=request.args if request.method == "GET" else None) as rhead:
+        resp = Response(stream_with_context(generate()), status=rhead.status_code)
+        ctype = rhead.headers.get("content-type", "application/octet-stream")
+        resp.headers["Content-Type"] = ctype
+        resp.headers["Cache-Control"] = rhead.headers.get("cache-control", "no-cache")
+        resp.headers["Connection"] = rhead.headers.get("connection", "keep-alive")
+        resp.headers["X-Accel-Buffering"] = "no"
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        return resp
 
 
 # ===== MAIN ENTRY =====
 if __name__ == "__main__":
-    # Start MCP server in background
     threading.Thread(target=run_mcp, daemon=True).start()
     print(f"[MCP] Server started with ID: {SERVER_ID} and token: {AUTH_TOKEN}")
-
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
