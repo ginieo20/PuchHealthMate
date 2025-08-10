@@ -61,41 +61,43 @@ def proxy_mcp(path: str):
         resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
+    client = httpx.Client(timeout=None)
+
     if method == "GET":
-        client = httpx.Client(timeout=None)
-        r = client.build_request("GET", target_url, headers=headers, params=request.args)
-        def generate():
-            with client.stream(r.method, r.url, headers=r.headers, params=request.args, timeout=None) as upstream:
+        with client.stream("GET", target_url, headers=headers, params=request.args, timeout=None) as upstream:
+            status = upstream.status_code
+            content_type = upstream.headers.get("content-type", "application/octet-stream")
+
+            def generate():
                 for chunk in upstream.iter_bytes():
                     if chunk:
                         yield chunk
-        # Fetch only headers and status first
-        with client.stream("GET", target_url, headers=headers, params=request.args, timeout=None) as upstream_head:
-            status = upstream_head.status_code
-            content_type = upstream_head.headers.get("content-type", "application/octet-stream")
+
             resp = Response(stream_with_context(generate()), status=status, direct_passthrough=True)
             resp.headers["Content-Type"] = content_type
-            # Pass through cache/control headers helpful for SSE
-            for h in ("cache-control", "connection", "transfer-encoding", "x-accel-buffering"):
-                if upstream_head.headers.get(h):
-                    resp.headers[h.title()] = upstream_head.headers[h]
+            resp.headers["Cache-Control"] = upstream.headers.get("cache-control", "no-cache")
+            resp.headers["Connection"] = upstream.headers.get("connection", "keep-alive")
+            if upstream.headers.get("x-accel-buffering"):
+                resp.headers["X-Accel-Buffering"] = upstream.headers["x-accel-buffering"]
             return resp
 
     elif method == "POST":
         data = request.get_data()
-        client = httpx.Client(timeout=None)
         with client.stream("POST", target_url, headers=headers, content=data, timeout=None) as upstream:
             status = upstream.status_code
             content_type = upstream.headers.get("content-type", "application/octet-stream")
+
             def generate_post():
                 for chunk in upstream.iter_bytes():
                     if chunk:
                         yield chunk
+
             resp = Response(stream_with_context(generate_post()), status=status, direct_passthrough=True)
             resp.headers["Content-Type"] = content_type
-            for h in ("cache-control", "connection", "transfer-encoding", "x-accel-buffering"):
-                if upstream.headers.get(h):
-                    resp.headers[h.title()] = upstream.headers[h]
+            resp.headers["Cache-Control"] = upstream.headers.get("cache-control", "no-cache")
+            resp.headers["Connection"] = upstream.headers.get("connection", "keep-alive")
+            if upstream.headers.get("x-accel-buffering"):
+                resp.headers["X-Accel-Buffering"] = upstream.headers["x-accel-buffering"]
             return resp
 
     return Response(status=405)
