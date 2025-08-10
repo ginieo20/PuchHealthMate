@@ -49,6 +49,7 @@ def home():
 
 
 @app.route("/mcp", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.route("/mcp/", methods=["GET", "POST", "OPTIONS", "HEAD"])  # explicit trailing-slash alias
 @app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS", "HEAD"])
 def mcp_http_proxy(path: str = ""):
     # Always use trailing slash base to avoid redirects from the internal server
