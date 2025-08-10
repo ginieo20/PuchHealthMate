@@ -1,4 +1,7 @@
-# MCP Starter for Puch AI
+# Health Mate
+
+HealthMate – Your smart AI partner for health advice, fitness tips, and wellness support.
+
 
 This is a starter template for creating your own Model Context Protocol (MCP) server that works with Puch AI. It comes with ready-to-use tools for job searching and image processing.
 
