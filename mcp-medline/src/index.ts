@@ -5,7 +5,7 @@ import { z } from "zod";
 type Env = Record<string, never>;
 
 export class MedlineMCP extends McpAgent<Env, Record<string, never>, Record<string, never>> {
-  server = new McpServer({ name: "medline-mcp-server", version: "1.0.0" });
+  server = new McpServer({ name: "HealthMate", version: "1.0.0" });
 
   async init() {
     // Validation tool
