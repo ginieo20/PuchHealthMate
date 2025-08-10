@@ -1,0 +1,19 @@
+{
+  "id": "HealthMate",
+  "name": "HealthMate",
+  "description": "HealthMate – Your smart AI partner for health advice, fitness tips, and wellness support.",
+  "transport": "streamable-http",
+  "start": {
+    "command": "python",
+    "args": ["mcp-bearer-token/app.py"]
+  },
+  "http": {
+    "url": "https://healthmate-nfpv.onrender.com/mcp",
+    "path": "/mcp",
+    "health": "/"
+  },
+  "auth": {
+    "type": "bearer",
+    "env": "AUTH_TOKEN"
+  }
+}

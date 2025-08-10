@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: healthmate
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp-bearer-token/app.py
+    envVars:
+      - key: AUTH_TOKEN
+        value: f4a8c72e-92b1-4b8a-a39e-3d5e2b1c67d8
+      - key: MY_NUMBER
+        value: "918830273648"
+      - key: HF_TOKEN
+        value: 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
+      - key: HF_PROVIDER
+        value: fireworks-ai
+      - key: MODEL_ID
+        value: deepseek-ai/DeepSeek-R1
+    autoDeploy: true
+    healthCheckPath: /

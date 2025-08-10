@@ -12,12 +12,16 @@ from pydantic import BaseModel, Field, AnyUrl
 import markdownify
 import httpx
 import readabilipy
+from huggingface_hub import InferenceClient
 
 # --- Load environment variables ---
 load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HF_API_TOKEN")
+HF_PROVIDER = os.environ.get("HF_PROVIDER")
+MODEL_ID = os.environ.get("MODEL_ID")
 
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
@@ -119,7 +123,7 @@ class Fetch:
 
 # --- MCP Server Setup ---
 mcp = FastMCP(
-    "Job Finder MCP Server",
+    "HealthMate",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
@@ -203,10 +207,109 @@ async def make_img_black_and_white(
     except Exception as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
 
+# --- Hugging Face Tools ---
+HF_TEXT_DESCRIPTION = RichToolDescription(
+    description="Generate text using a Hugging Face text-generation model via Inference API.",
+    use_when="Use this to generate or continue text given a prompt using a HF-hosted model.",
+)
+
+@mcp.tool(description=HF_TEXT_DESCRIPTION.model_dump_json())
+async def hf_text_generate(
+    model: Annotated[str, Field(description="Hugging Face model id, e.g., 'meta-llama/Llama-3.2-3B-Instruct' or 'Qwen/Qwen2.5-7B-Instruct'")],
+    prompt: Annotated[str, Field(description="The input prompt for generation")],
+    max_new_tokens: Annotated[int | None, Field(description="Maximum new tokens to generate")] = 256,
+    temperature: Annotated[float | None, Field(description="Sampling temperature (higher = more random)")] = 0.7,
+    top_p: Annotated[float | None, Field(description="Top-p nucleus sampling cutoff")] = 0.95,
+) -> str:
+    try:
+        client = InferenceClient(api_key=HF_TOKEN)
+        # Run blocking HF call in a thread to avoid blocking the event loop
+        generated_text = await asyncio.to_thread(
+            client.text_generation,
+            prompt,
+            model=model,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=False,
+        )
+        # client.text_generation may return a string or a dict depending on version; normalize to string
+        if isinstance(generated_text, dict) and "generated_text" in generated_text:
+            return str(generated_text["generated_text"])
+        return str(generated_text)
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Hugging Face text generation failed: {e}"))
+
+HF_IMAGE_DESCRIPTION = RichToolDescription(
+    description="Generate an image from text using a Hugging Face diffusion model via Inference API.",
+    use_when="Use this when the user requests an image given a text prompt.",
+    side_effects="Returns a generated image as base64-encoded PNG.",
+)
+
+@mcp.tool(description=HF_IMAGE_DESCRIPTION.model_dump_json())
+async def hf_text_to_image(
+    model: Annotated[str, Field(description="Hugging Face model id for text-to-image, e.g., 'stabilityai/stable-diffusion-xl-base-1.0' or 'black-forest-labs/FLUX.1-dev'")],
+    prompt: Annotated[str, Field(description="The text description for the image")],
+    guidance_scale: Annotated[float | None, Field(description="Classifier-free guidance scale (model-dependent)")] = 7.5,
+    num_inference_steps: Annotated[int | None, Field(description="Number of denoising steps (model-dependent)")] = 28,
+) -> list[TextContent | ImageContent]:
+    import base64
+    import io
+    from PIL import Image
+
+    try:
+        client = InferenceClient(api_key=HF_TOKEN)
+        image: Image.Image = await asyncio.to_thread(
+            client.text_to_image,
+            prompt,
+            model=model,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+        )
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return [ImageContent(type="image", mimeType="image/png", data=img_b64)]
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Hugging Face image generation failed: {e}"))
+
+# Chat completion tool matching test.py style
+HF_CHAT_DESCRIPTION = RichToolDescription(
+    description="Chat completion via Hugging Face Inference API providers (e.g., fireworks-ai).",
+    use_when="Use this to call chat models like deepseek-ai/DeepSeek-R1 or others with role-based messages.",
+)
+
+@mcp.tool(description=HF_CHAT_DESCRIPTION.model_dump_json())
+async def hf_chat_completion(
+    messages: Annotated[list[dict], Field(description="List of {'role','content'} chat messages")],
+    model: Annotated[str | None, Field(description="Model id to use. Defaults to env MODEL_ID if not provided.")] = None,
+    provider: Annotated[str | None, Field(description="HF provider (e.g., 'fireworks-ai'). Defaults to env HF_PROVIDER if not provided.")] = None,
+    remove_think_tags: Annotated[bool, Field(description="Strip <think>...</think> tags from output if present")] = True,
+) -> str:
+    import re
+    try:
+        resolved_model = model or MODEL_ID
+        if not resolved_model:
+            raise ValueError("Model id not provided and MODEL_ID not set in environment")
+        client = InferenceClient(provider=provider or HF_PROVIDER, api_key=HF_TOKEN)
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=resolved_model,
+            messages=messages,
+        )
+        content = completion.choices[0].message.content
+        if remove_think_tags and isinstance(content, str):
+            content = re.sub(r"<think>.*?</think>\n*", "", content, flags=re.DOTALL)
+        return content.strip() if isinstance(content, str) else str(content)
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Hugging Face chat completion failed: {e}"))
+
 # --- Run MCP Server ---
 async def main():
-    print("🚀 Starting MCP server on http://0.0.0.0:8086")
-    await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
+    import os
+    port = int(os.environ.get("PORT", "10000"))
+    print(f"🚀 Starting MCP server 'HealthMate' on http://0.0.0.0:{port}/mcp/")
+    await mcp.run_async("streamable-http", host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     asyncio.run(main())

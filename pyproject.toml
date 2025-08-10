@@ -11,5 +11,7 @@ dependencies = [
     "markdownify>=1.1.0",
     "pillow>=11.3.0",
     "python-dotenv>=1.1.1",
+    "huggingface_hub>=0.25.2",
+    "flask>=3.0.0",
     "readabilipy>=0.3.0",
 ]
