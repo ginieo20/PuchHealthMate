@@ -29,6 +29,11 @@ def start_mcp_in_thread():
     t.start()
 
 
+@app.get("/")
+def health_root():
+    return jsonify({"service": "HealthMate", "status": "ok"}), 200
+
+
 # Reverse proxy any /mcp* path to the internal MCP server
 @app.route("/mcp", defaults={"path": ""}, methods=["GET", "POST", "OPTIONS"])
 @app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS"])
