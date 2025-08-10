@@ -8,6 +8,7 @@
     "args": ["mcp-bearer-token/app.py"]
   },
   "http": {
+    "url": "https://healthmate-nfpv.onrender.com/mcp",
     "path": "/mcp",
     "health": "/"
   },
