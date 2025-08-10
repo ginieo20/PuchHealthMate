@@ -19,14 +19,25 @@ MCP_INTERNAL = "http://127.0.0.1:8086"
 app = Flask(__name__)
 
 
+# Start MCP server in a background thread exactly once
+_mcp_started = False
+_mcp_lock = threading.Lock()
+
 def run_mcp_server():
     asyncio.run(mcp_main())
 
 
-@app.before_first_request
-def start_mcp_in_thread():
-    t = threading.Thread(target=run_mcp_server, daemon=True)
-    t.start()
+def ensure_mcp_started():
+    global _mcp_started
+    if not _mcp_started:
+        with _mcp_lock:
+            if not _mcp_started:
+                t = threading.Thread(target=run_mcp_server, daemon=True)
+                t.start()
+                _mcp_started = True
+
+# Ensure MCP starts at import time
+ensure_mcp_started()
 
 
 @app.get("/")
