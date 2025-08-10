@@ -71,18 +71,20 @@ def mcp_http_proxy(path: str = ""):
     else:
         return Response(status=405)
 
-    def generate():
-        with upstream as r:
-            for chunk in r.iter_bytes():
+    def generate_stream(r: httpx.Response):
+        with r as rr:
+            for chunk in rr.iter_bytes():
                 if chunk:
                     yield chunk
 
-    with client.stream("GET", target, headers=headers, params=request.args if request.method == "GET" else None) as rhead:
-        resp = Response(stream_with_context(generate()), status=rhead.status_code)
-        ctype = rhead.headers.get("content-type", "application/octet-stream")
+    # Open a single upstream stream and mirror headers from it
+    with upstream as r:
+        status = r.status_code
+        ctype = r.headers.get("content-type", "application/octet-stream")
+        resp = Response(stream_with_context(generate_stream(r)), status=status)
         resp.headers["Content-Type"] = ctype
-        resp.headers["Cache-Control"] = rhead.headers.get("cache-control", "no-cache")
-        resp.headers["Connection"] = rhead.headers.get("connection", "keep-alive")
+        resp.headers["Cache-Control"] = r.headers.get("cache-control", "no-cache")
+        resp.headers["Connection"] = r.headers.get("connection", "keep-alive")
         resp.headers["X-Accel-Buffering"] = "no"
         resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
         return resp
