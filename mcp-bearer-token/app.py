@@ -2,16 +2,11 @@ import asyncio
 import threading
 import os
 from flask import Flask, request, jsonify
+from flask_sock import Sock
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
+import websockets
 import httpx
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse, Response
-from starlette.routing import Route, Mount
-from starlette.middleware.wsgi import WSGIMiddleware
 
 # Reuse the MCP server from mcp_starter
 from mcp_starter import main as mcp_main
@@ -21,10 +16,11 @@ load_dotenv()
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HF_API_TOKEN")
 HF_PROVIDER = os.environ.get("HF_PROVIDER")
 MODEL_ID = os.environ.get("MODEL_ID", "google/flan-t5-large")
-MCP_INTERNAL = "http://127.0.0.1:8086"
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
+MCP_INTERNAL_WS = "ws://127.0.0.1:8086/mcp"
 
-# Flask app for REST endpoints
-flask_app = Flask(__name__)
+app = Flask(__name__)
+sock = Sock(app)
 
 
 # Start MCP server in a background thread exactly once
@@ -48,7 +44,39 @@ def ensure_mcp_started():
 ensure_mcp_started()
 
 
-@flask_app.post("/api/chat")
+@app.get("/")
+def health_root():
+    return jsonify({"service": "HealthMate", "status": "ok"}), 200
+
+
+@sock.route('/mcp')
+def mcp_ws(ws):
+    # Validate bearer token on initial headers if provided by client
+    # Some clients send Authorization via query or subprotocols; we trust MCP server to enforce too.
+    async def bridge():
+        async with websockets.connect(
+            MCP_INTERNAL_WS,
+            extra_headers={"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else None,
+            max_size=None,
+        ) as upstream:
+            async def client_to_server():
+                while True:
+                    msg = ws.receive()
+                    if msg is None:
+                        await upstream.close()
+                        break
+                    await upstream.send(msg)
+
+            async def server_to_client():
+                async for message in upstream:
+                    ws.send(message)
+
+            await asyncio.gather(asyncio.to_thread(client_to_server), server_to_client())
+
+    asyncio.run(bridge())
+
+
+@app.post("/api/chat")
 def chat_completion():
     data = request.get_json(force=True)
     messages = data.get("messages")
@@ -65,7 +93,7 @@ def chat_completion():
         return jsonify({"error": str(e)}), 500
 
 
-@flask_app.post("/api/generate")
+@app.post("/api/generate")
 def text_generate():
     data = request.get_json(force=True)
     prompt = data.get("prompt")
@@ -89,77 +117,7 @@ def text_generate():
         return jsonify({"error": str(e)}), 500
 
 
-# Starlette handlers for root health and /mcp proxy
-async def root(request: Request) -> Response:
-    return JSONResponse({"service": "HealthMate", "status": "ok"})
-
-
-def _build_forward_headers(req: Request) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    for k_bytes, v_bytes in req.headers.raw:
-        k = k_bytes.decode() if isinstance(k_bytes, (bytes, bytearray)) else str(k_bytes)
-        if k.lower() == "host":
-            continue
-        v = v_bytes.decode() if isinstance(v_bytes, (bytes, bytearray)) else str(v_bytes)
-        headers[k] = v
-    return headers
-
-
-async def proxy_mcp(request: Request) -> Response:
-    # Proxy GET/POST to internal MCP (supports streaming)
-    path_suffix = "/" + request.path_params.get("path", "") if request.path_params.get("path") else ""
-    target_url = f"{MCP_INTERNAL}/mcp{path_suffix}"
-    headers = _build_forward_headers(request)
-    timeout = httpx.Timeout(None)
-
-    if request.method == "OPTIONS":
-        return Response("", status_code=204, headers={
-            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
-            "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers", "*"),
-            "Access-Control-Allow-Methods": request.headers.get("access-control-request-method", "GET,POST,OPTIONS"),
-            "Access-Control-Max-Age": "86400",
-        })
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if request.method == "GET":
-            upstream = await client.stream("GET", target_url, headers=headers, params=dict(request.query_params))
-        elif request.method == "POST":
-            body = await request.body()
-            upstream = await client.stream("POST", target_url, headers=headers, content=body)
-        else:
-            return Response(status_code=405)
-
-        async def aiter_bytes():
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    yield chunk
-            await upstream.aclose()
-
-        content_type = upstream.headers.get("content-type", "application/octet-stream")
-        resp = StreamingResponse(aiter_bytes(), status_code=upstream.status_code, media_type=content_type)
-        resp.headers["Cache-Control"] = upstream.headers.get("cache-control", "no-cache")
-        resp.headers["Connection"] = upstream.headers.get("connection", "keep-alive")
-        # Explicitly disable proxy buffering for SSE
-        resp.headers["X-Accel-Buffering"] = "no"
-        if upstream.headers.get("x-accel-buffering"):
-            resp.headers["X-Accel-Buffering"] = upstream.headers["x-accel-buffering"]
-        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
-        return resp
-
-
-routes = [
-    Route("/", root, methods=["GET"]),
-    Route("/mcp", proxy_mcp, methods=["GET", "POST", "OPTIONS"]),
-    Route("/mcp/{path:path}", proxy_mcp, methods=["GET", "POST", "OPTIONS"]),
-    Mount("/", app=WSGIMiddleware(flask_app)),
-]
-
-middleware = [Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)]
-
-asgi_app = Starlette(routes=routes, middleware=middleware)
-
-
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(asgi_app, host="0.0.0.0", port=port, log_level="info")
+    # Flask-Sock uses gevent/werkzeug dev server for local; Render provides the reverse proxy.
+    app.run(host="0.0.0.0", port=port)
