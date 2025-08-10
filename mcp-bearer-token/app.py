@@ -52,7 +52,17 @@ def home():
 @app.route("/mcp/<path:path>", methods=["GET", "POST", "OPTIONS"])
 def mcp_http_proxy(path: str = ""):
     target = f"http://127.0.0.1:8765/mcp" + (f"/{path}" if path else "")
-    headers = {k: v for k, v in request.headers if k.lower() != "host"}
+    # Forward only essential headers, ensure Authorization is preserved exactly
+    headers = {}
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    if auth_header:
+        headers["Authorization"] = auth_header
+    accept = request.headers.get("Accept")
+    if accept:
+        headers["Accept"] = accept
+    content_type = request.headers.get("Content-Type")
+    if content_type:
+        headers["Content-Type"] = content_type
 
     if request.method == "OPTIONS":
         resp = Response("", status=204)
@@ -77,7 +87,6 @@ def mcp_http_proxy(path: str = ""):
                 if chunk:
                     yield chunk
 
-    # Open a single upstream stream and mirror headers from it
     with upstream as r:
         status = r.status_code
         ctype = r.headers.get("content-type", "application/octet-stream")
