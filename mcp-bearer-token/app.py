@@ -139,6 +139,8 @@ async def proxy_mcp(request: Request) -> Response:
         resp = StreamingResponse(aiter_bytes(), status_code=upstream.status_code, media_type=content_type)
         resp.headers["Cache-Control"] = upstream.headers.get("cache-control", "no-cache")
         resp.headers["Connection"] = upstream.headers.get("connection", "keep-alive")
+        # Explicitly disable proxy buffering for SSE
+        resp.headers["X-Accel-Buffering"] = "no"
         if upstream.headers.get("x-accel-buffering"):
             resp.headers["X-Accel-Buffering"] = upstream.headers["x-accel-buffering"]
         resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
